@@ -2,11 +2,12 @@
 
 基于 Ultralytics YOLO26 与 UFLD/Row-Anchor 思路改造的机器人前视多线检测工程。
 
-> 更新日期：2026-08-03  
+> 更新日期：2026-09-19  
 > 当前稳定方案：四个固定语义槽位、每个槽位最多一条曲线  
-> 当前部署目标：RDK X5 / OpenExplorer / NV12 Runtime
+> 当前部署目标：RDK X5 / OpenExplorer / NV12 Runtime  
+> 分支定位：`main` 保留 V2 原始大分类头，作为训练/推理/部署对照基线；已验证的拆头 BPU 方案位于 `quant_correct`
 
-本项目已将原始单线 Lane Robot 改造成四槽位多线检测系统，训练、验证、PyTorch 推理、ONNX 导出与 ONNX Runtime 推理主链路已经跑通。RDK X5 Runtime BIN 已成功生成，但当前分类输出层仍因 BPU 维度限制回退到 CPU，属于 BPU + CPU 混合执行模型。
+本项目已将原始单线 Lane Robot 改造成四槽位多线检测系统，训练、验证、PyTorch 推理、ONNX 导出与 ONNX Runtime 推理主链路已经跑通。`main` 分支刻意保留 V2 的单个大分类 Linear：RDK X5 Runtime BIN 已成功生成，但 `cls_fc2` 因单次输出 71904 个元素超过 BPU 相关限制而回退到 CPU，因此该分支仍是 BPU + CPU 混合执行基线。项目已经在 `quant_correct` 分支通过真正拆分分类头完成量化并验证 BPU 可部署，所以这里的 CPU fallback 仅代表 `main` 结构，不再代表整个项目的部署上限。
 
 ---
 
@@ -53,7 +54,7 @@
 | PyTorch Predictor | 已接通 | 可解码、绘图和保存预测 txt |
 | ONNX 导出 | 已完成 | Opset 11，当前合并输出 `[B, 322, 56, 4]` |
 | ONNX Runtime 推理 | 已完成 | 支持 CPU/CUDA Provider、Resize/LetterBox |
-| RDK X5 Runtime BIN | 已生成 | NV12 输入，当前为 BPU + CPU 混合执行 |
+| RDK X5 Runtime BIN | 已生成 | `main` 的旧大分类头仍为 BPU + CPU 混合执行；BPU 拆头部署见 `quant_correct` |
 | 逐槽位指标 | 待完成 | 当前总体指标可能掩盖单槽位失败 |
 | 严格断点绘制 | 待修正 | 当前 ONNX 绘图仍可能跨缺失 Anchor 连线 |
 | Polyline head | 实验阶段 | 尚未完成训练、导出和部署闭环 |
@@ -608,33 +609,28 @@ NV12 输入
 → lane_output [1, 322, 56, 4]
 ```
 
-### 13.3 当前推荐路线
+### 13.3 与 `quant_correct` 的关系
 
-第一阶段先使用混合模型完成：
+`main` 不再承担“继续尝试把大 `cls_fc2` 塞进 BPU”的任务。它的价值是保留原始 V2 输出定义和已验证训练/推理链路，作为精度、ONNX 数值和部署性能的对照基线。
 
-- 板端加载与输出检查。
-- C++ 后处理。
-- 精度对比。
-- `hb_perf` 和真实端到端 FPS 测试。
-- CPU 占用与 BPU/CPU 数据搬运开销测试。
-
-如果分类 Head 成为明显瓶颈，再把一个大 Linear 真正拆成两个：
+RDK X5 的实际 BPU 方案已经放到 `quant_correct`：
 
 ```text
-cls_fc2_01: 321 × 56 × 2 = 35952
-cls_fc2_23: 321 × 56 × 2 = 35952
-offset_fc : 1 × 56 × 4   = 224
+main
+└── cls_fc2: 321 × 56 × 4 = 71904
+    └── 超过限制，CPU fallback
+
+quant_correct
+├── cls_fc2_01: 321 × 56 × 2 = 35952
+├── cls_fc2_23: 321 × 56 × 2 = 35952
+└── 已完成量化，并验证该拆头方案可部署到 BPU
 ```
 
-推荐新 ONNX 输出：
+因此：
 
-```text
-cls_01 [1, 321, 56, 2]
-cls_23 [1, 321, 56, 2]
-offset [1,   1, 56, 4]
-```
-
-只在旧大 `Gemm` 后增加 `Split` 无效，必须在 PyTorch Head 中创建两个较小的 Linear/Gemm，并正确迁移旧权重。
+- 复现原始 V2、比较 FP32/ONNX 数值：使用 `main`。
+- 做 RDK X5 BPU 部署：优先使用 `quant_correct`。
+- 不应把 `main` 的大 Gemm CPU fallback 继续描述成项目尚未解决的问题。
 
 ---
 
@@ -689,7 +685,7 @@ Mosaic、MixUp、CutMix、Copy-Paste 会破坏连续通道结构，当前训练�
 2. `train_xhm.py` 当前启用了轻微 HSV、旋转和水平翻转，并非无增强基线。
 3. `infer_onnx_xhm.py` 的默认权重路径仍指向特定历史实验目录，正式使用应显式传 `--model`。
 4. 当前 ONNX 绘图会把同一槽位所有有效点一次性连成折线，可能跨遮挡区连接。
-5. 当前 RDK BIN 不是全 BPU 模型，分类大 `Gemm` 位于 CPU。
+5. `main` 的 RDK BIN 仍是混合模型，分类大 `Gemm` 位于 CPU；该限制已在 `quant_correct` 通过拆头并完成 BPU 部署验证。
 6. 当前总体验证指标不足以确认每个固定语义槽位都学会。
 
 ---
@@ -728,11 +724,11 @@ channel_right/MAE
 - 控制层禁止跨大段 no-lane 拟合。
 - 对遮挡前后段分别评估稳定性。
 
-### P4：RDK 板端实测
+### P4：RDK 板端对照
 
-- 完成 C++ Softmax、Top-K soft-argmax、offset 和坐标恢复。
-- 测试 Runtime BIN 的精度、FPS、CPU 和 BPU 占用。
-- 再决定是否拆分分类 Head。
+- `main` 保留旧大 Head，作为混合执行性能对照。
+- BPU 正式部署使用 `quant_correct` 的双分类头版本。
+- 对比两分支的精度、FPS、CPU/BPU 占用和数据搬运开销。
 
 ### P5：实验 Polyline Head
 
